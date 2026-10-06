@@ -26,8 +26,11 @@
 
 #include <Log.h>
 #include <SessionState.h>
+#include <atomic>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <type_traits>
 
 #include "catch_amalgamated.hpp"
 
@@ -94,5 +97,103 @@ TEST_CASE("SessionStateTests") {
     state.backup();
 
     CHECK(0 == log.eventsBackup);
+  }
+}
+
+TEST_CASE("SessionState lastSentTime snapshots") {
+  const UtcTimeStamp first(1, 2, 3, 123456789, 4, 5, 2024, 9);
+  const UtcTimeStamp second(21, 22, 23, 987654321, 24, 11, 2025, 9);
+  SessionState state(first);
+  const SessionState &constState = state;
+
+  SECTION("copies remain unchanged after an update") {
+    CHECK((std::is_same<decltype(state.lastSentTime()), UtcTimeStamp>::value));
+    CHECK((std::is_same<decltype(constState.lastSentTime()), UtcTimeStamp>::value));
+    const auto &snapshot = state.lastSentTime();
+    const auto &constSnapshot = constState.lastSentTime();
+    state.lastSentTime(second);
+    CHECK(snapshot == first);
+    CHECK(constSnapshot == first);
+    CHECK(state.lastSentTime() == second);
+    CHECK(constState.lastSentTime() == second);
+  }
+
+  SECTION("concurrent reads copy a complete timestamp") {
+    const UtcTimeStamp now(21, 23, 23, 987654321, 24, 11, 2025, 9);
+    state.heartBtInt(30);
+    state.lastReceivedTime(now);
+    state.sentLogout(true);
+    state.logoutTimeout(2);
+    state.testRequest(0);
+    constexpr int iterations = 100000;
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<unsigned int> failures{0};
+    auto awaitStart = [&] {
+      ready.fetch_add(1);
+      while (!start.load()) {
+        std::this_thread::yield();
+      }
+    };
+    std::thread writer([&] {
+      awaitStart();
+      for (int i = 0; i < iterations; ++i) {
+        state.lastSentTime(i % 2 == 0 ? second : first);
+      }
+    });
+    std::thread reader([&] {
+      awaitStart();
+      for (int i = 0; i < iterations; ++i) {
+        const UtcTimeStamp snapshot = state.lastSentTime();
+        const UtcTimeStamp constSnapshot = constState.lastSentTime();
+        if ((snapshot != first && snapshot != second) || (constSnapshot != first && constSnapshot != second)) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (constState.withinHeartBeat(now) || !constState.needHeartbeat(now) || !constState.logoutTimedOut(now)) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+    while (ready.load() != 2) {
+      std::this_thread::yield();
+    }
+    start.store(true);
+    writer.join();
+    reader.join();
+    CHECK(failures.load() == 0);
+  }
+}
+
+TEST_CASE("SessionState heartbeat and logout boundaries") {
+  const UtcTimeStamp sent(12, 0, 0, 123456789, 4, 5, 2024, 9);
+  SessionState state(sent);
+  state.heartBtInt(30);
+  state.logoutTimeout(2);
+  state.sentLogout(true);
+
+  SECTION("heartbeat is due at the interval") {
+    for (int elapsed : {29, 30, 31}) {
+      UtcTimeStamp now = sent;
+      now += elapsed;
+      state.lastReceivedTime(now);
+      CAPTURE(elapsed);
+      CHECK(state.withinHeartBeat(now) == (elapsed < 30));
+      CHECK(state.needHeartbeat(now) == (elapsed >= 30));
+      state.testRequest(1);
+      CHECK_FALSE(state.needHeartbeat(now));
+      state.testRequest(0);
+    }
+  }
+
+  SECTION("logout times out at the interval") {
+    for (int elapsed : {1, 2, 3}) {
+      UtcTimeStamp now = sent;
+      now += elapsed;
+      CAPTURE(elapsed);
+      CHECK(state.logoutTimedOut(now) == (elapsed >= 2));
+      state.sentLogout(false);
+      CHECK_FALSE(state.logoutTimedOut(now));
+      state.sentLogout(true);
+    }
   }
 }

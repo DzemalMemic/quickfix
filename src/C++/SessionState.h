@@ -30,6 +30,7 @@
 #include "Log.h"
 #include "MessageStore.h"
 #include "Mutex.h"
+#include <mutex>
 
 namespace FIX {
 /// Maintains all of state for the Session class.
@@ -99,9 +100,20 @@ public:
   HeartBtInt &heartBtInt() { return m_heartBtInt; }
   const HeartBtInt &heartBtInt() const { return m_heartBtInt; }
 
-  void lastSentTime(const UtcTimeStamp &value) { m_lastSentTime = value; }
-  UtcTimeStamp &lastSentTime() { return m_lastSentTime; }
-  const UtcTimeStamp &lastSentTime() const { return m_lastSentTime; }
+  void lastSentTime(const UtcTimeStamp &value) {
+    std::lock_guard<std::mutex> lock(m_lastSentTimeMutex);
+    m_lastSentTime = value;
+  }
+  /// Returns an independent snapshot of the last sent timestamp.
+  UtcTimeStamp lastSentTime() {
+    std::lock_guard<std::mutex> lock(m_lastSentTimeMutex);
+    return m_lastSentTime;
+  }
+  /// Returns an independent snapshot of the last sent timestamp.
+  UtcTimeStamp lastSentTime() const {
+    std::lock_guard<std::mutex> lock(m_lastSentTimeMutex);
+    return m_lastSentTime;
+  }
 
   void lastReceivedTime(const UtcTimeStamp &value) { m_lastReceivedTime = value; }
   UtcTimeStamp &lastReceivedTime() { return m_lastReceivedTime; }
@@ -258,6 +270,7 @@ private:
   Log *m_pLog;
   NullLog m_nullLog;
   mutable Mutex m_mutex;
+  mutable std::mutex m_lastSentTimeMutex;
 };
 } // namespace FIX
 
