@@ -26,15 +26,36 @@
 
 #include <Log.h>
 #include <SessionState.h>
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <future>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 #include "catch_amalgamated.hpp"
 
 using namespace FIX;
+
+namespace FIX {
+struct SessionStateTestAccess {
+  static void setVersion(SessionState &state, uint64_t version) {
+    std::lock_guard<std::mutex> lock(state.m_lastSentTimeMutex);
+    state.m_lastSentVersion.store(version);
+  }
+
+  static uint64_t version(const SessionState &state) { return state.m_lastSentVersion.load(); }
+
+  static std::unique_lock<std::mutex> lockTimestamp(SessionState &state) {
+    return std::unique_lock<std::mutex>(state.m_lastSentTimeMutex);
+  }
+};
+} // namespace FIX
 
 TEST_CASE("SessionStateTests") {
   class TestLog : public Log {
@@ -196,4 +217,183 @@ TEST_CASE("SessionState heartbeat and logout boundaries") {
       state.sentLogout(true);
     }
   }
+}
+
+TEST_CASE("SessionState timestamp preserves raw precision and range") {
+  SessionState state(UtcTimeStamp(DateTime(0, 0)));
+  for (int date : {std::numeric_limits<int>::min(), -1, 0, 1, std::numeric_limits<int>::max()}) {
+    for (int64_t nanos :
+         {std::numeric_limits<int64_t>::min(),
+          int64_t(-1),
+          int64_t(0),
+          int64_t(1),
+          int64_t(86399999999999),
+          std::numeric_limits<int64_t>::max()}) {
+      CAPTURE(date, nanos);
+      const UtcTimeStamp value(DateTime(date, nanos));
+      SessionState constructed(value);
+      state.lastSentTime(value);
+      const SessionState &constState = state;
+      for (auto snapshot : {state.lastSentTime(), constState.lastSentTime(), constructed.lastSentTime()}) {
+        CHECK(snapshot.m_date == date);
+        CHECK(snapshot.m_time == nanos);
+        snapshot.set(0, 0);
+      }
+      CHECK(state.lastSentTime() == value);
+    }
+  }
+}
+
+TEST_CASE("SessionState timestamp preserves calendar transitions") {
+  const std::array<UtcTimeStamp, 6> values{
+      UtcTimeStamp(23, 59, 59, 999999999, 28, 2, 2024, 9),
+      UtcTimeStamp(0, 0, 0, 1, 29, 2, 2024, 9),
+      UtcTimeStamp(23, 59, 59, 999999999, 29, 2, 2024, 9),
+      UtcTimeStamp(0, 0, 0, 1, 1, 3, 2024, 9),
+      UtcTimeStamp(23, 59, 59, 999999999, 31, 12, 2025, 9),
+      UtcTimeStamp(0, 0, 0, 1, 1, 1, 2026, 9)};
+  SessionState state(values.front());
+  for (const auto &value : values) {
+    state.lastSentTime(value);
+    CHECK(state.lastSentTime() == value);
+    CHECK(state.lastSentTime().getNanosecond() == value.getNanosecond());
+  }
+  state.lastSentTime(values.front());
+  CHECK(state.lastSentTime() == values.front());
+}
+
+TEST_CASE("SessionState timestamp keeps subsecond deadline semantics") {
+  const UtcTimeStamp sent(23, 59, 40, 987654321, 31, 12, 2025, 9);
+  SessionState state(sent);
+  state.heartBtInt(30);
+  state.logoutTimeout(30);
+  state.sentLogout(true);
+  const std::array<UtcTimeStamp, 4> times{
+      UtcTimeStamp(0, 0, 9, 999999999, 1, 1, 2026, 9),
+      UtcTimeStamp(0, 0, 10, 0, 1, 1, 2026, 9),
+      UtcTimeStamp(0, 0, 10, 1, 1, 1, 2026, 9),
+      UtcTimeStamp(23, 59, 39, 999999999, 31, 12, 2025, 9)};
+  const std::array<bool, 4> expired{false, true, true, false};
+  for (size_t i = 0; i < times.size(); ++i) {
+    CAPTURE(i);
+    state.lastReceivedTime(times[i]);
+    CHECK(state.needHeartbeat(times[i]) == expired[i]);
+    CHECK(state.withinHeartBeat(times[i]) == !expired[i]);
+    CHECK(state.logoutTimedOut(times[i]) == expired[i]);
+  }
+}
+
+TEST_CASE("SessionState timestamp supports multiple writers") {
+  const std::array<UtcTimeStamp, 4> values{
+      UtcTimeStamp(DateTime(std::numeric_limits<int>::min(), std::numeric_limits<int64_t>::max())),
+      UtcTimeStamp(DateTime(std::numeric_limits<int>::max(), std::numeric_limits<int64_t>::min())),
+      UtcTimeStamp(23, 59, 59, 999999999, 29, 2, 2024, 9),
+      UtcTimeStamp(0, 0, 0, 1, 1, 3, 2024, 9)};
+  for (uint32_t seed : {5U, 17U, 1345U}) {
+    CAPTURE(seed);
+    SessionState state(values.front());
+    const SessionState &constState = state;
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<unsigned int> invalid{0};
+    std::vector<std::thread> workers;
+    for (unsigned int worker = 0; worker < 8; ++worker) {
+      workers.emplace_back([&, worker] {
+        uint32_t random = seed + worker;
+        ++ready;
+        while (!start.load()) {
+          std::this_thread::yield();
+        }
+        for (int i = 0; i < 50000; ++i) {
+          random ^= random << 13;
+          random ^= random >> 17;
+          random ^= random << 5;
+          if (worker < 4) {
+            state.lastSentTime(values[random % values.size()]);
+          } else {
+            const auto snapshot = worker % 2 ? state.lastSentTime() : constState.lastSentTime();
+            if (std::find(values.begin(), values.end(), snapshot) == values.end()) {
+              invalid.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+        }
+      });
+    }
+    while (ready.load() != 8) {
+      std::this_thread::yield();
+    }
+    start.store(true);
+    for (auto &worker : workers) {
+      worker.join();
+    }
+    CHECK(invalid.load() == 0);
+  }
+}
+
+TEST_CASE("SessionState timestamp version saturates without reuse") {
+  const UtcTimeStamp first(1, 2, 3, 123456789, 4, 5, 2024, 9);
+  const UtcTimeStamp second(21, 22, 23, 987654321, 24, 11, 2025, 9);
+  SessionState state(first);
+  const auto exhausted = std::numeric_limits<uint64_t>::max();
+  SessionStateTestAccess::setVersion(state, exhausted - 3);
+  state.lastSentTime(second);
+  CHECK(SessionStateTestAccess::version(state) == exhausted - 1);
+  CHECK(state.lastSentTime() == second);
+  state.lastSentTime(first);
+  CHECK(SessionStateTestAccess::version(state) == exhausted);
+  CHECK(state.lastSentTime() == first);
+  state.lastSentTime(second);
+  CHECK(SessionStateTestAccess::version(state) == exhausted);
+  CHECK(state.lastSentTime() == second);
+  std::thread writer([&] {
+    for (int i = 0; i < 20000; ++i) {
+      state.lastSentTime(i % 2 ? first : second);
+    }
+  });
+  unsigned int invalid = 0;
+  for (int i = 0; i < 20000; ++i) {
+    const auto snapshot = static_cast<const SessionState &>(state).lastSentTime();
+    invalid += snapshot != first && snapshot != second;
+  }
+  writer.join();
+  CHECK(invalid == 0);
+  CHECK(SessionStateTestAccess::version(state) == exhausted);
+}
+
+TEST_CASE("SessionState stable timestamp reads do not wait for the writer mutex") {
+  const UtcTimeStamp value(1, 2, 3, 123456789, 4, 5, 2024, 9);
+  SessionState state(value);
+  auto lock = SessionStateTestAccess::lockTimestamp(state);
+  auto reader = std::async(std::launch::async, [&] { return state.lastSentTime(); });
+  const auto status = reader.wait_for(std::chrono::seconds(2));
+  lock.unlock();
+  const auto snapshot = reader.get();
+  CHECK(status == std::future_status::ready);
+  CHECK(snapshot == value);
+}
+
+TEST_CASE("SessionState timestamp follows an external publication handshake") {
+  const UtcTimeStamp first(1, 2, 3, 123456789, 4, 5, 2024, 9);
+  const UtcTimeStamp second(21, 22, 23, 987654321, 24, 11, 2025, 9);
+  SessionState state(first);
+  std::atomic<bool> published{false};
+  std::thread writer([&] {
+    for (int i = 0; i < 20000; ++i) {
+      while (published.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      state.lastSentTime(i % 2 ? first : second);
+      published.store(true, std::memory_order_release);
+    }
+  });
+  unsigned int invalid = 0;
+  for (int i = 0; i < 20000; ++i) {
+    while (!published.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    invalid += state.lastSentTime() != (i % 2 ? first : second);
+    published.store(false, std::memory_order_release);
+  }
+  writer.join();
+  CHECK(invalid == 0);
 }

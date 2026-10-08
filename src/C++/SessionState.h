@@ -30,6 +30,8 @@
 #include "Log.h"
 #include "MessageStore.h"
 #include "Mutex.h"
+#include <atomic>
+#include <limits>
 #include <mutex>
 
 namespace FIX {
@@ -49,7 +51,8 @@ public:
         m_logonTimeout(10),
         m_logoutTimeout(2),
         m_testRequest(0),
-        m_lastSentTime(now),
+        m_lastSentDate(now.m_date),
+        m_lastSentNanos(now.m_time),
         m_lastReceivedTime(now),
         m_pStore(0),
         m_pLog(0) {}
@@ -102,17 +105,36 @@ public:
 
   void lastSentTime(const UtcTimeStamp &value) {
     std::lock_guard<std::mutex> lock(m_lastSentTimeMutex);
-    m_lastSentTime = value;
+    const auto version = m_lastSentVersion.load(std::memory_order_relaxed);
+    const auto exhausted = std::numeric_limits<uint64_t>::max();
+    if (version != exhausted) {
+      m_lastSentVersion.store(version + 1, std::memory_order_relaxed);
+    }
+    // Observing either new field makes the reader's acquire fence observe the odd version.
+    std::atomic_thread_fence(std::memory_order_release);
+    m_lastSentDate.store(value.m_date, std::memory_order_relaxed);
+    m_lastSentNanos.store(value.m_time, std::memory_order_relaxed);
+    // Saturation permanently selects the mutex path instead of reusing a version.
+    if (version < exhausted - 1) {
+      m_lastSentVersion.store(version + 2, std::memory_order_release);
+    }
   }
   /// Returns an independent snapshot of the last sent timestamp.
-  UtcTimeStamp lastSentTime() {
-    std::lock_guard<std::mutex> lock(m_lastSentTimeMutex);
-    return m_lastSentTime;
-  }
+  UtcTimeStamp lastSentTime() { return static_cast<const SessionState &>(*this).lastSentTime(); }
   /// Returns an independent snapshot of the last sent timestamp.
   UtcTimeStamp lastSentTime() const {
+    const auto version = m_lastSentVersion.load(std::memory_order_acquire);
+    if (!(version & 1)) {
+      const auto date = m_lastSentDate.load(std::memory_order_relaxed);
+      const auto nanos = m_lastSentNanos.load(std::memory_order_relaxed);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (version == m_lastSentVersion.load(std::memory_order_relaxed)) {
+        return UtcTimeStamp(DateTime(date, nanos));
+      }
+    }
     std::lock_guard<std::mutex> lock(m_lastSentTimeMutex);
-    return m_lastSentTime;
+    return UtcTimeStamp(
+        DateTime(m_lastSentDate.load(std::memory_order_relaxed), m_lastSentNanos.load(std::memory_order_relaxed)));
   }
 
   void lastReceivedTime(const UtcTimeStamp &value) { m_lastReceivedTime = value; }
@@ -250,6 +272,8 @@ public:
   }
 
 private:
+  friend struct SessionStateTestAccess;
+
   bool m_enabled;
   bool m_receivedLogon;
   bool m_sentLogout;
@@ -262,7 +286,9 @@ private:
   int m_testRequest;
   ResendRange m_resendRange;
   HeartBtInt m_heartBtInt;
-  UtcTimeStamp m_lastSentTime;
+  std::atomic<int> m_lastSentDate;
+  std::atomic<int64_t> m_lastSentNanos;
+  std::atomic<uint64_t> m_lastSentVersion{0};
   UtcTimeStamp m_lastReceivedTime;
   std::string m_logoutReason;
   Messages m_queue;
