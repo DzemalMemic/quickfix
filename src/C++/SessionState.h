@@ -106,7 +106,7 @@ public:
   void lastSentTime(const UtcTimeStamp &value) {
     std::lock_guard<std::mutex> lock(m_lastSentTimeMutex);
     const auto version = m_lastSentVersion.load(std::memory_order_relaxed);
-    const auto exhausted = std::numeric_limits<uint64_t>::max();
+    const auto exhausted = (std::numeric_limits<uint64_t>::max)();
     if (version != exhausted) {
       m_lastSentVersion.store(version + 1, std::memory_order_relaxed);
     }
